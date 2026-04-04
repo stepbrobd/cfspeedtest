@@ -27,8 +27,7 @@ const DOWNLOAD_URL: &str = "__down?bytes=";
 const UPLOAD_URL: &str = "__up";
 static RE_CF_REQUEST_DURATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"cfRequestDuration;dur=([\d.]+)").unwrap());
-static RE_CFL4_RTT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[?&]rtt=(\d+)").unwrap());
+static RE_CFL4_RTT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[?&]rtt=(\d+)").unwrap());
 static WARNED_NO_HEADER: AtomicBool = AtomicBool::new(false);
 static WARNED_UNKNOWN_HEADER: AtomicBool = AtomicBool::new(false);
 const TIME_THRESHOLD: Duration = Duration::from_secs(5);
@@ -1508,7 +1507,10 @@ mod tests {
         let header = "cfRequestDuration;dur=3.456";
         let total_ms = 50.0;
         let result = parse_latency_from_server_timing(header, total_ms);
-        assert!(result.is_some(), "Should parse legacy cfRequestDuration header");
+        assert!(
+            result.is_some(),
+            "Should parse legacy cfRequestDuration header"
+        );
         let latency = result.unwrap();
         // latency = total_ms - server_duration = 50.0 - 3.456 = 46.544
         assert!((latency - 46.544).abs() < 0.001);
@@ -1517,7 +1519,8 @@ mod tests {
     #[test]
     fn test_parse_latency_from_cfl4_header() {
         // New cfL4 format - rtt is in microseconds
-        let header = r#"cfL4;desc="?proto=TCP&rtt=5003&min_rtt=4257&rtt_var=2477&sent=6&recv=6&lost=0""#;
+        let header =
+            r#"cfL4;desc="?proto=TCP&rtt=5003&min_rtt=4257&rtt_var=2477&sent=6&recv=6&lost=0""#;
         let total_ms = 50.0;
         let result = parse_latency_from_server_timing(header, total_ms);
         assert!(result.is_some(), "Should parse cfL4 rtt header");
@@ -1531,7 +1534,10 @@ mod tests {
         let header = "some-unrelated;value=123";
         let total_ms = 50.0;
         let result = parse_latency_from_server_timing(header, total_ms);
-        assert!(result.is_none(), "Should return None for unrecognized header");
+        assert!(
+            result.is_none(),
+            "Should return None for unrecognized header"
+        );
     }
 
     #[test]
