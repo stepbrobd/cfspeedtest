@@ -14,7 +14,10 @@ use serde::Serialize;
 use std::{
     fmt::Display,
     io::Write,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        LazyLock,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -22,7 +25,11 @@ use std::{
 const BASE_URL: &str = "https://speed.cloudflare.com";
 const DOWNLOAD_URL: &str = "__down?bytes=";
 const UPLOAD_URL: &str = "__up";
-static WARNED_NEGATIVE_LATENCY: AtomicBool = AtomicBool::new(false);
+static RE_CF_REQUEST_DURATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"cfRequestDuration;dur=([\d.]+)").unwrap());
+static RE_CFL4_RTT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[?&]rtt=(\d+)").unwrap());
+static WARNED_NO_HEADER: AtomicBool = AtomicBool::new(false);
+static WARNED_UNKNOWN_HEADER: AtomicBool = AtomicBool::new(false);
 const TIME_THRESHOLD: Duration = Duration::from_secs(5);
 const MAX_ATTEMPT_FACTOR: u32 = 4;
 const RETRY_BASE_BACKOFF: Duration = Duration::from_millis(250);
@@ -181,58 +188,94 @@ pub fn run_latency_test(
         if output_format == OutputFormat::StdOut {
             print_progress("latency test", i + 1, nr_latency_tests);
         }
-        let latency = test_latency(client);
-        measurements.push(latency);
+        if let Some(latency) = try_test_latency(client) {
+            measurements.push(latency);
+        }
     }
-    let avg_latency = measurements.iter().sum::<f64>() / measurements.len() as f64;
+    let avg_latency = if measurements.is_empty() {
+        0.0
+    } else {
+        measurements.iter().sum::<f64>() / measurements.len() as f64
+    };
 
     if output_format == OutputFormat::StdOut {
-        println!(
-            "\nAvg GET request latency {avg_latency:.2} ms (RTT excluding server processing time)\n"
-        );
+        println!("\nAvg GET request latency {avg_latency:.2} ms\n");
     }
     (measurements, avg_latency)
 }
 
-pub fn test_latency(client: &Client) -> f64 {
+// Parse latency from a Server-Timing header value. Supports the legacy
+// cfRequestDuration format and the newer cfL4 format. Returns None if
+// the header doesn't match either.
+fn parse_latency_from_server_timing(header: &str, total_ms: f64) -> Option<f64> {
+    // Legacy: cfRequestDuration;dur=<milliseconds>
+    if let Some(caps) = RE_CF_REQUEST_DURATION.captures(header) {
+        if let Some(dur_match) = caps.get(1) {
+            if let Ok(server_duration) = dur_match.as_str().parse::<f64>() {
+                let latency = total_ms - server_duration;
+                return Some(if latency < 0.0 { 0.0 } else { latency });
+            }
+        }
+    }
+
+    // Current: cfL4;desc="?...&rtt=<microseconds>&..."
+    // [?&] anchor prevents matching min_rtt= or rtt_var=
+    if header.contains("cfL4") {
+        if let Some(caps) = RE_CFL4_RTT.captures(header) {
+            if let Some(rtt_match) = caps.get(1) {
+                if let Ok(rtt_us) = rtt_match.as_str().parse::<f64>() {
+                    return Some(rtt_us / 1_000.0);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn try_test_latency(client: &Client) -> Option<f64> {
     let url = &format!("{}/{}{}", BASE_URL, DOWNLOAD_URL, 0);
     let req_builder = client.get(url);
 
     let start = Instant::now();
-    let mut response = req_builder.send().expect("failed to get response");
+    let mut response = match req_builder.send() {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::debug!("Latency test request failed: {e}");
+            return None;
+        }
+    };
     let _status_code = response.status();
-    // Drain body to complete the request; ignore errors.
     let _ = std::io::copy(&mut response, &mut std::io::sink());
     let total_ms = start.elapsed().as_secs_f64() * 1_000.0;
 
-    let re = Regex::new(r"cfRequestDuration;dur=([\d.]+)").unwrap();
     let server_timing = response
         .headers()
         .get("Server-Timing")
-        .expect("No Server-Timing in response header")
-        .to_str()
-        .unwrap();
-    let cf_req_duration: f64 = re
-        .captures(server_timing)
-        .unwrap()
-        .get(1)
-        .unwrap()
-        .as_str()
-        .parse()
-        .unwrap();
-    let mut req_latency = total_ms - cf_req_duration;
-    log::debug!(
-        "latency debug: total_ms={total_ms:.3} cf_req_duration_ms={cf_req_duration:.3} req_latency_total={req_latency:.3} server_timing={server_timing}"
-    );
-    if req_latency < 0.0 {
-        if !WARNED_NEGATIVE_LATENCY.swap(true, Ordering::Relaxed) {
-            log::warn!(
-                "negative latency after server timing subtraction; clamping to 0.0 (total_ms={total_ms:.3} cf_req_duration_ms={cf_req_duration:.3})"
-            );
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(header) = server_timing {
+        if let Some(latency) = parse_latency_from_server_timing(header, total_ms) {
+            log::debug!("latency: total_ms={total_ms:.3} parsed={latency:.3}");
+            return Some(latency);
         }
-        req_latency = 0.0
+        if !WARNED_UNKNOWN_HEADER.swap(true, Ordering::Relaxed) {
+            log::warn!("Server-Timing header format not recognized, falling back to raw RTT");
+        }
+    } else {
+        if !WARNED_NO_HEADER.swap(true, Ordering::Relaxed) {
+            log::warn!("No Server-Timing header in response, falling back to raw RTT");
+        }
     }
-    req_latency
+    log::debug!("latency fallback: total_ms={total_ms:.3}");
+    Some(total_ms)
+}
+
+pub fn test_latency(client: &Client) -> f64 {
+    try_test_latency(client).unwrap_or_else(|| {
+        log::debug!("Latency measurement failed, returning 0.0");
+        0.0
+    })
 }
 
 #[derive(Debug)]
@@ -1456,5 +1499,112 @@ mod tests {
             "✓ Metadata integration test passed: ip={}, colo={}, country={}",
             metadata.ip, metadata.colo, metadata.country
         );
+    }
+
+    #[test]
+    fn test_parse_latency_from_legacy_header() {
+        // Old cfRequestDuration format
+        let header = "cfRequestDuration;dur=3.456";
+        let total_ms = 50.0;
+        let result = parse_latency_from_server_timing(header, total_ms);
+        assert!(
+            result.is_some(),
+            "Should parse legacy cfRequestDuration header"
+        );
+        let latency = result.unwrap();
+        // latency = total_ms - server_duration = 50.0 - 3.456 = 46.544
+        assert!((latency - 46.544).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_latency_from_cfl4_header() {
+        // New cfL4 format - rtt is in microseconds
+        let header =
+            r#"cfL4;desc="?proto=TCP&rtt=5003&min_rtt=4257&rtt_var=2477&sent=6&recv=6&lost=0""#;
+        let total_ms = 50.0;
+        let result = parse_latency_from_server_timing(header, total_ms);
+        assert!(result.is_some(), "Should parse cfL4 rtt header");
+        let latency = result.unwrap();
+        // rtt=5003 microseconds = 5.003 milliseconds
+        assert!((latency - 5.003).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_latency_missing_header() {
+        let header = "some-unrelated;value=123";
+        let total_ms = 50.0;
+        let result = parse_latency_from_server_timing(header, total_ms);
+        assert!(
+            result.is_none(),
+            "Should return None for unrecognized header"
+        );
+    }
+
+    #[test]
+    fn test_parse_latency_prefers_legacy_over_cfl4() {
+        // If both are present (unlikely but defensive), prefer legacy
+        let header = "cfRequestDuration;dur=3.456, cfL4;desc=\"?proto=TCP&rtt=5003\"";
+        let total_ms = 50.0;
+        let result = parse_latency_from_server_timing(header, total_ms);
+        assert!(result.is_some());
+        let latency = result.unwrap();
+        assert!((latency - 46.544).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_latency_cfl4_zero_rtt() {
+        let header = r#"cfL4;desc="?proto=TCP&rtt=0&min_rtt=0""#;
+        let total_ms = 50.0;
+        let result = parse_latency_from_server_timing(header, total_ms);
+        assert!(result.is_some());
+        assert!((result.unwrap() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_latency_negative_clamp() {
+        // Legacy header where server processing > total RTT (clock skew)
+        let header = "cfRequestDuration;dur=100.0";
+        let total_ms = 50.0;
+        let result = parse_latency_from_server_timing(header, total_ms);
+        assert!(result.is_some());
+        // Should clamp to 0, not return negative
+        assert!((result.unwrap() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_latency_cfl4_does_not_match_min_rtt() {
+        // Regression: rtt= regex must not match min_rtt= or rtt_var=
+        // Header with min_rtt before rtt - if regex is naive, it grabs min_rtt's value
+        let header = r#"cfL4;desc="?proto=TCP&min_rtt=4257&rtt_var=2477&rtt=5003&sent=6""#;
+        let total_ms = 50.0;
+        let result = parse_latency_from_server_timing(header, total_ms);
+        assert!(result.is_some());
+        let latency = result.unwrap();
+        // Must match rtt=5003, NOT min_rtt=4257
+        assert!((latency - 5.003).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_test_latency_no_panic_on_request_failure() {
+        // Proxy pointed at a port with nothing listening - instant connection refused.
+        let client = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+            .build()
+            .unwrap();
+        // Must not panic. Returns 0.0 as the fallback for request failure.
+        let result = test_latency(&client);
+        assert!((result - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_run_latency_test_all_failures_returns_zero_avg() {
+        // Every request fails immediately - failed samples are skipped
+        let client = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+            .build()
+            .unwrap();
+        let (measurements, avg) = run_latency_test(&client, 3, OutputFormat::Json);
+        assert!(measurements.is_empty(), "Failed requests should be skipped");
+        assert!((avg - 0.0).abs() < 0.001, "Average should be 0.0");
     }
 }
